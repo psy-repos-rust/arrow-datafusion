@@ -21,7 +21,6 @@ mod avro;
 #[cfg(test)]
 mod chunked_store;
 mod csv;
-mod delimited_stream;
 mod file_stream;
 mod json;
 mod parquet;
@@ -34,7 +33,6 @@ use arrow::{
     array::{ArrayData, ArrayRef, DictionaryArray},
     buffer::Buffer,
     datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type},
-    error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
 pub use avro::AvroExec;
@@ -42,10 +40,11 @@ use datafusion_physical_expr::PhysicalSortExpr;
 pub use file_stream::{FileOpenFuture, FileOpener, FileStream};
 pub(crate) use json::plan_to_json;
 pub use json::NdJsonExec;
-use parking_lot::RwLock;
 
-use crate::datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl};
-use crate::{config::ConfigOptions, datasource::listing::FileRange};
+use crate::datasource::{
+    listing::{FileRange, PartitionedFile},
+    object_store::ObjectStoreUrl,
+};
 use crate::{
     error::{DataFusionError, Result},
     scalar::ScalarValue,
@@ -64,7 +63,7 @@ use std::{
 
 use super::{ColumnStatistics, Statistics};
 
-/// convert logical type of partition column to physical type: Dictionary(UInt16, val_type)
+/// Convert logical type of partition column to physical type: `Dictionary(UInt16, val_type)`
 pub fn partition_type_wrap(val_type: DataType) -> DataType {
     DataType::Dictionary(Box::new(DataType::UInt16), Box::new(val_type))
 }
@@ -75,6 +74,9 @@ pub fn partition_type_wrap(val_type: DataType) -> DataType {
 pub struct FileScanConfig {
     /// Object store URL, used to get an [`ObjectStore`] instance from
     /// [`RuntimeEnv::object_store`]
+    ///
+    /// [`ObjectStore`]: object_store::ObjectStore
+    /// [`RuntimeEnv::object_store`]: crate::execution::runtime_env::RuntimeEnv::object_store
     pub object_store_url: ObjectStoreUrl,
     /// Schema before `projection` is applied. It contains the all columns that may
     /// appear in the files. It does not include table partition columns
@@ -95,15 +97,15 @@ pub struct FileScanConfig {
     /// Columns on which to project the data. Indexes that are higher than the
     /// number of columns of `file_schema` refer to `table_partition_cols`.
     pub projection: Option<Vec<usize>>,
-    /// The maximum number of records to read from this plan. If None,
+    /// The maximum number of records to read from this plan. If `None`,
     /// all records after filtering are returned.
     pub limit: Option<usize>,
     /// The partitioning columns
     pub table_partition_cols: Vec<(String, DataType)>,
     /// The order in which the data is sorted, if known.
     pub output_ordering: Option<Vec<PhysicalSortExpr>>,
-    /// Configuration options passed to the physical plans
-    pub config_options: Arc<RwLock<ConfigOptions>>,
+    /// Indicates whether this plan may produce an infinite stream of records.
+    pub infinite_source: bool,
 }
 
 impl FileScanConfig {
@@ -157,6 +159,7 @@ impl FileScanConfig {
         (table_schema, table_stats)
     }
 
+    #[allow(unused)] // Only used by avro
     fn projected_file_column_names(&self) -> Option<Vec<String>> {
         self.projection.as_ref().map(|p| {
             p.iter()
@@ -178,22 +181,43 @@ impl FileScanConfig {
 }
 
 /// A wrapper to customize partitioned file display
+///
+/// Prints in the format:
+/// ```text
+/// {NUM_GROUPS groups: [[file1, file2,...], [fileN, fileM, ...], ...]}
+/// ```
 #[derive(Debug)]
 struct FileGroupsDisplay<'a>(&'a [Vec<PartitionedFile>]);
 
 impl<'a> Display for FileGroupsDisplay<'a> {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        let parts: Vec<_> = self
-            .0
-            .iter()
-            .map(|pp| {
-                pp.iter()
-                    .map(|pf| pf.object_meta.location.as_ref())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .collect();
-        write!(f, "[{}]", parts.join(", "))
+        let mut first_group = true;
+        let groups = if self.0.len() == 1 { "group" } else { "groups" };
+        write!(f, "{{{} {}: [", self.0.len(), groups)?;
+        for group in self.0 {
+            if !first_group {
+                write!(f, ", ")?;
+            }
+            first_group = false;
+            write!(f, "[")?;
+
+            let mut first_file = true;
+            for pf in group {
+                if !first_file {
+                    write!(f, ", ")?;
+                }
+                first_file = false;
+
+                write!(f, "{}", pf.object_meta.location.as_ref())?;
+
+                if let Some(range) = pf.range.as_ref() {
+                    write!(f, ":{}..{}", range.start, range.end)?;
+                }
+            }
+            write!(f, "]")?;
+        }
+        write!(f, "]}}")?;
+        Ok(())
     }
 }
 
@@ -239,6 +263,7 @@ impl SchemaAdapter {
 
     /// Map a column index in the table schema to a column index in a particular
     /// file schema
+    ///
     /// Panics if index is not in range for the table schema
     pub(crate) fn map_column_index(
         &self,
@@ -332,8 +357,8 @@ struct PartitionColumnProjector {
 
 impl PartitionColumnProjector {
     // Create a projector to insert the partitioning columns into batches read from files
-    // - projected_schema: the target schema with both file and partitioning columns
-    // - table_partition_cols: all the partitioning column names
+    // - `projected_schema`: the target schema with both file and partitioning columns
+    // - `table_partition_cols`: all the partitioning column names
     fn new(projected_schema: SchemaRef, table_partition_cols: &[String]) -> Self {
         let mut idx_map = HashMap::new();
         for (partition_idx, partition_name) in table_partition_cols.iter().enumerate() {
@@ -354,18 +379,18 @@ impl PartitionColumnProjector {
 
     // Transform the batch read from the file by inserting the partitioning columns
     // to the right positions as deduced from `projected_schema`
-    // - file_batch: batch read from the file, with internal projection applied
-    // - partition_values: the list of partition values, one for each partition column
+    // - `file_batch`: batch read from the file, with internal projection applied
+    // - `partition_values`: the list of partition values, one for each partition column
     fn project(
         &mut self,
         file_batch: RecordBatch,
         partition_values: &[ScalarValue],
-    ) -> ArrowResult<RecordBatch> {
+    ) -> Result<RecordBatch> {
         let expected_cols =
             self.projected_schema.fields().len() - self.projected_partition_indexes.len();
 
         if file_batch.columns().len() != expected_cols {
-            return Err(ArrowError::SchemaError(format!(
+            return Err(DataFusionError::Execution(format!(
                 "Unexpected batch schema from file, expected {} cols but got {}",
                 expected_cols,
                 file_batch.columns().len()
@@ -382,7 +407,7 @@ impl PartitionColumnProjector {
                 ),
             )
         }
-        RecordBatch::try_new(Arc::clone(&self.projected_schema), cols)
+        RecordBatch::try_new(Arc::clone(&self.projected_schema), cols).map_err(Into::into)
     }
 }
 
@@ -506,21 +531,20 @@ impl From<ObjectMeta> for FileMeta {
 pub(crate) fn get_output_ordering(
     base_config: &FileScanConfig,
 ) -> Option<&[PhysicalSortExpr]> {
-    if let Some(output_ordering) = base_config.output_ordering.as_ref() {
-        if base_config.file_groups.iter().any(|group| group.len() > 1) {
+    base_config.output_ordering.as_ref()
+        .map(|output_ordering| if base_config.file_groups.iter().any(|group| group.len() > 1) {
             debug!("Skipping specified output ordering {:?}. Some file group had more than one file: {:?}",
                    output_ordering, base_config.file_groups);
             None
         } else {
-            Some(output_ordering)
-        }
-    } else {
-        None
-    }
+            Some(output_ordering.as_slice())
+        }).unwrap_or_else(|| None)
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+
     use crate::{
         test::{build_table_i32, columns},
         test_util::aggr_test_schema,
@@ -792,8 +816,50 @@ mod tests {
             projection,
             statistics,
             table_partition_cols,
-            config_options: ConfigOptions::new().into_shareable(),
             output_ordering: None,
+            infinite_source: false,
+        }
+    }
+
+    #[test]
+    fn file_groups_display_empty() {
+        let expected = "{0 groups: []}";
+        assert_eq!(&FileGroupsDisplay(&[]).to_string(), expected);
+    }
+
+    #[test]
+    fn file_groups_display_one() {
+        let files = [vec![partitioned_file("foo"), partitioned_file("bar")]];
+
+        let expected = "{1 group: [[foo, bar]]}";
+        assert_eq!(&FileGroupsDisplay(&files).to_string(), expected);
+    }
+
+    #[test]
+    fn file_groups_display_many() {
+        let files = [
+            vec![partitioned_file("foo"), partitioned_file("bar")],
+            vec![partitioned_file("baz")],
+            vec![],
+        ];
+
+        let expected = "{3 groups: [[foo, bar], [baz], []]}";
+        assert_eq!(&FileGroupsDisplay(&files).to_string(), expected);
+    }
+
+    /// create a PartitionedFile for testing
+    fn partitioned_file(path: &str) -> PartitionedFile {
+        let object_meta = ObjectMeta {
+            location: object_store::path::Path::parse(path).unwrap(),
+            last_modified: Utc::now(),
+            size: 42,
+        };
+
+        PartitionedFile {
+            object_meta,
+            partition_values: vec![],
+            range: None,
+            extensions: None,
         }
     }
 }

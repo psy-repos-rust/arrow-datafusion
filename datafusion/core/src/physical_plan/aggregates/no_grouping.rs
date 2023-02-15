@@ -18,8 +18,6 @@
 //! Aggregate without grouping columns
 
 use crate::execution::context::TaskContext;
-use crate::execution::memory_manager::proxy::MemoryConsumerProxy;
-use crate::execution::MemoryConsumerId;
 use crate::physical_plan::aggregates::{
     aggregate_expressions, create_accumulators, finalize_aggregation, AccumulatorItem,
     AggregateMode,
@@ -27,7 +25,6 @@ use crate::physical_plan::aggregates::{
 use crate::physical_plan::metrics::{BaselineMetrics, RecordOutput};
 use crate::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use arrow::datatypes::SchemaRef;
-use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
 use datafusion_physical_expr::{AggregateExpr, PhysicalExpr};
@@ -35,11 +32,12 @@ use futures::stream::BoxStream;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use futures::stream::{Stream, StreamExt};
 
 /// stream struct for aggregation without grouping columns
 pub(crate) struct AggregateStream {
-    stream: BoxStream<'static, ArrowResult<RecordBatch>>,
+    stream: BoxStream<'static, Result<RecordBatch>>,
     schema: SchemaRef,
 }
 
@@ -55,7 +53,7 @@ struct AggregateStreamInner {
     baseline_metrics: BaselineMetrics,
     aggregate_expressions: Vec<Vec<Arc<dyn PhysicalExpr>>>,
     accumulators: Vec<AccumulatorItem>,
-    memory_consumer: MemoryConsumerProxy,
+    reservation: MemoryReservation,
     finished: bool,
 }
 
@@ -69,14 +67,12 @@ impl AggregateStream {
         baseline_metrics: BaselineMetrics,
         context: Arc<TaskContext>,
         partition: usize,
-    ) -> datafusion_common::Result<Self> {
+    ) -> Result<Self> {
         let aggregate_expressions = aggregate_expressions(&aggr_expr, &mode, 0)?;
         let accumulators = create_accumulators(&aggr_expr)?;
-        let memory_consumer = MemoryConsumerProxy::new(
-            "GroupBy None Accumulators",
-            MemoryConsumerId::new(partition),
-            Arc::clone(&context.runtime_env().memory_manager),
-        );
+
+        let reservation = MemoryConsumer::new(format!("AggregateStream[{partition}]"))
+            .register(context.memory_pool());
 
         let inner = AggregateStreamInner {
             schema: Arc::clone(&schema),
@@ -85,7 +81,7 @@ impl AggregateStream {
             baseline_metrics,
             aggregate_expressions,
             accumulators,
-            memory_consumer,
+            reservation,
             finished: false,
         };
         let stream = futures::stream::unfold(inner, |mut this| async move {
@@ -111,14 +107,11 @@ impl AggregateStream {
                         // allocate memory
                         // This happens AFTER we actually used the memory, but simplifies the whole accounting and we are OK with
                         // overshooting a bit. Also this means we either store the whole record batch or not.
-                        let result = match result {
-                            Ok(allocated) => this.memory_consumer.alloc(allocated).await,
-                            Err(e) => Err(e),
-                        };
-
-                        match result {
+                        match result
+                            .and_then(|allocated| this.reservation.try_grow(allocated))
+                        {
                             Ok(_) => continue,
-                            Err(e) => Err(ArrowError::ExternalError(Box::new(e))),
+                            Err(e) => Err(e),
                         }
                     }
                     Some(Err(e)) => Err(e),
@@ -126,9 +119,9 @@ impl AggregateStream {
                         this.finished = true;
                         let timer = this.baseline_metrics.elapsed_compute().timer();
                         let result = finalize_aggregation(&this.accumulators, &this.mode)
-                            .map_err(|e| ArrowError::ExternalError(Box::new(e)))
                             .and_then(|columns| {
                                 RecordBatch::try_new(this.schema.clone(), columns)
+                                    .map_err(Into::into)
                             })
                             .record_output(&this.baseline_metrics);
 
@@ -152,7 +145,7 @@ impl AggregateStream {
 }
 
 impl Stream for AggregateStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,

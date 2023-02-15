@@ -170,8 +170,7 @@ pub fn power(args: &[ArrayRef]) -> Result<ArrayRef> {
         )) as ArrayRef),
 
         other => Err(DataFusionError::Internal(format!(
-            "Unsupported data type {:?} for function power",
-            other
+            "Unsupported data type {other:?} for function power"
         ))),
     }
 }
@@ -197,8 +196,41 @@ pub fn atan2(args: &[ArrayRef]) -> Result<ArrayRef> {
         )) as ArrayRef),
 
         other => Err(DataFusionError::Internal(format!(
-            "Unsupported data type {:?} for function atan2",
-            other
+            "Unsupported data type {other:?} for function atan2"
+        ))),
+    }
+}
+
+pub fn log(args: &[ArrayRef]) -> Result<ArrayRef> {
+    // Support overloaded log(base, x) and log(x) which defaults to log(10, x)
+    // note in f64::log params order is different than in sql. e.g in sql log(base, x) == f64::log(x, base)
+    let mut base = &(Arc::new(Float32Array::from_value(10.0, args[0].len())) as ArrayRef);
+    let mut x = &args[0];
+    if args.len() == 2 {
+        x = &args[1];
+        base = &args[0];
+    }
+    match args[0].data_type() {
+        DataType::Float64 => Ok(Arc::new(make_function_inputs2!(
+            x,
+            base,
+            "x",
+            "base",
+            Float64Array,
+            { f64::log }
+        )) as ArrayRef),
+
+        DataType::Float32 => Ok(Arc::new(make_function_inputs2!(
+            x,
+            base,
+            "x",
+            "base",
+            Float32Array,
+            { f32::log }
+        )) as ArrayRef),
+
+        other => Err(DataFusionError::Internal(format!(
+            "Unsupported data type {other:?} for function log"
         ))),
     }
 }

@@ -18,7 +18,6 @@
 use arrow::array::{Int32Array, Int64Array};
 use arrow::compute::kernels::aggregate;
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
-use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
 use datafusion::from_slice::FromSlice;
@@ -85,7 +84,7 @@ impl RecordBatchStream for TestCustomRecordBatchStream {
 }
 
 impl Stream for TestCustomRecordBatchStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         self: Pin<&mut Self>,
@@ -93,7 +92,7 @@ impl Stream for TestCustomRecordBatchStream {
     ) -> Poll<Option<Self::Item>> {
         if self.nb_batch > 0 {
             self.get_mut().nb_batch -= 1;
-            Poll::Ready(Some(TEST_CUSTOM_RECORD_BATCH!()))
+            Poll::Ready(Some(TEST_CUSTOM_RECORD_BATCH!().map_err(Into::into)))
         } else {
             Poll::Ready(None)
         }
@@ -193,12 +192,12 @@ impl TableProvider for CustomTableProvider {
     async fn scan(
         &self,
         _state: &SessionState,
-        projection: &Option<Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(CustomExecutionPlan {
-            projection: projection.clone(),
+            projection: projection.cloned(),
         }))
     }
 }
@@ -208,11 +207,12 @@ async fn custom_source_dataframe() -> Result<()> {
     let ctx = SessionContext::new();
 
     let table = ctx.read_table(Arc::new(CustomTableProvider))?;
-    let logical_plan = LogicalPlanBuilder::from(table.to_logical_plan()?)
+    let (state, plan) = table.into_parts();
+    let logical_plan = LogicalPlanBuilder::from(plan)
         .project(vec![col("c2")])?
         .build()?;
 
-    let optimized_plan = ctx.optimize(&logical_plan)?;
+    let optimized_plan = state.optimize(&logical_plan)?;
     match &optimized_plan {
         LogicalPlan::Projection(Projection { input, .. }) => match &**input {
             LogicalPlan::TableScan(TableScan {
@@ -229,19 +229,17 @@ async fn custom_source_dataframe() -> Result<()> {
     }
 
     let expected = format!(
-        "Projection: {}.c2\
-        \n  TableScan: {} projection=[c2]",
-        UNNAMED_TABLE, UNNAMED_TABLE
+        "Projection: {UNNAMED_TABLE}.c2\
+        \n  TableScan: {UNNAMED_TABLE} projection=[c2]"
     );
-    assert_eq!(format!("{:?}", optimized_plan), expected);
+    assert_eq!(format!("{optimized_plan:?}"), expected);
 
-    let physical_plan = ctx.create_physical_plan(&optimized_plan).await?;
+    let physical_plan = state.create_physical_plan(&optimized_plan).await?;
 
     assert_eq!(1, physical_plan.schema().fields().len());
     assert_eq!("c2", physical_plan.schema().field(0).name().as_str());
 
-    let task_ctx = ctx.task_ctx();
-    let batches = collect(physical_plan, task_ctx).await?;
+    let batches = collect(physical_plan, state.task_ctx()).await?;
     let origin_rec_batch = TEST_CUSTOM_RECORD_BATCH!()?;
     assert_eq!(1, batches.len());
     assert_eq!(1, batches[0].num_columns());
@@ -261,16 +259,12 @@ async fn optimizers_catch_all_statistics() {
         .await
         .unwrap();
 
-    let physical_plan = ctx
-        .create_physical_plan(&df.to_logical_plan().unwrap())
-        .await
-        .unwrap();
+    let physical_plan = df.create_physical_plan().await.unwrap();
 
     // when the optimization kicks in, the source is replaced by an EmptyExec
     assert!(
         contains_empty_exec(Arc::clone(&physical_plan)),
-        "Expected aggregate_statistics optimizations missing: {:?}",
-        physical_plan
+        "Expected aggregate_statistics optimizations missing: {physical_plan:?}"
     );
 
     let expected = RecordBatch::try_new(
@@ -291,7 +285,7 @@ async fn optimizers_catch_all_statistics() {
     let actual = collect(physical_plan, task_ctx).await.unwrap();
 
     assert_eq!(actual.len(), 1);
-    assert_eq!(format!("{:?}", actual[0]), format!("{:?}", expected));
+    assert_eq!(format!("{:?}", actual[0]), format!("{expected:?}"));
 }
 
 fn contains_empty_exec(plan: Arc<dyn ExecutionPlan>) -> bool {

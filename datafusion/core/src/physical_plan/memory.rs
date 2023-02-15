@@ -29,7 +29,6 @@ use super::{
 };
 use crate::error::Result;
 use arrow::datatypes::SchemaRef;
-use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 
 use crate::execution::context::TaskContext;
@@ -86,8 +85,7 @@ impl ExecutionPlan for MemoryExec {
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Err(DataFusionError::Internal(format!(
-            "Children cannot be replaced in {:?}",
-            self
+            "Children cannot be replaced in {self:?}"
         )))
     }
 
@@ -179,7 +177,7 @@ impl MemoryStream {
 }
 
 impl Stream for MemoryStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,

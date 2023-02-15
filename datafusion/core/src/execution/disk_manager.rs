@@ -110,8 +110,7 @@ impl DiskManager {
         let mut guard = self.local_dirs.lock();
         let local_dirs = guard.as_mut().ok_or_else(|| {
             DataFusionError::ResourcesExhausted(format!(
-                "Memory Exhausted while {} (DiskManager is disabled)",
-                request_description
+                "Memory Exhausted while {request_description} (DiskManager is disabled)"
             ))
         })?;
 
@@ -140,6 +139,9 @@ fn create_local_dirs(local_dirs: Vec<PathBuf>) -> Result<Vec<TempDir>> {
     local_dirs
         .iter()
         .map(|root| {
+            if !std::path::Path::new(root).exists() {
+                std::fs::create_dir(root)?;
+            }
             Builder::new()
                 .prefix("datafusion-")
                 .tempdir_in(root)
@@ -215,6 +217,16 @@ mod tests {
         )
     }
 
+    #[test]
+    fn test_disk_manager_create_spill_folder() {
+        let config = DiskManagerConfig::new_specified(vec!["DOESNT_EXIST".into()]);
+
+        DiskManager::try_new(config)
+            .unwrap()
+            .create_tmp_file("Testing")
+            .unwrap();
+    }
+
     /// Asserts that `file_path` is found anywhere in any of `dir` directories
     fn assert_path_in_dirs<'a>(
         file_path: &'a Path,
@@ -228,6 +240,6 @@ mod tests {
                 .any(|candidate_path| *file_path == candidate_path)
         });
 
-        assert!(found, "Can't find {:?} in dirs: {:?}", file_path, dirs);
+        assert!(found, "Can't find {file_path:?} in dirs: {dirs:?}");
     }
 }

@@ -17,7 +17,7 @@
 
 //! Coercion rules for matching argument types for binary operators
 
-use crate::type_coercion::is_numeric;
+use crate::type_coercion::{is_date, is_numeric, is_timestamp};
 use crate::Operator;
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{
@@ -45,8 +45,6 @@ pub fn binary_operator_data_type(
         | Operator::NotEq
         | Operator::And
         | Operator::Or
-        | Operator::Like
-        | Operator::NotLike
         | Operator::Lt
         | Operator::Gt
         | Operator::GtEq
@@ -86,7 +84,7 @@ pub fn binary_operator_data_type(
 /// when the input argument types do not match the output argument
 /// types
 ///
-/// Tracking issue is https://github.com/apache/arrow-datafusion/issues/3419
+/// Tracking issue is <https://github.com/apache/arrow-datafusion/issues/3419>
 pub fn coerce_types(
     lhs_type: &DataType,
     op: &Operator,
@@ -102,7 +100,7 @@ pub fn coerce_types(
         Operator::And | Operator::Or => match (lhs_type, rhs_type) {
             // logical binary boolean operators can only be evaluated in bools or nulls
             (DataType::Boolean, DataType::Boolean) => Some(DataType::Boolean),
-            (DataType::Null, DataType::Null) => Some(DataType::Null),
+            (DataType::Null, DataType::Null) => Some(DataType::Boolean),
             (DataType::Boolean, DataType::Null) | (DataType::Null, DataType::Boolean) => {
                 Some(DataType::Boolean)
             }
@@ -115,16 +113,21 @@ pub fn coerce_types(
         | Operator::Gt
         | Operator::GtEq
         | Operator::LtEq => comparison_coercion(lhs_type, rhs_type),
-        // "like" operators operate on strings and always return a boolean
-        Operator::Like | Operator::NotLike => like_coercion(lhs_type, rhs_type),
-        // date +/- interval returns date
         Operator::Plus | Operator::Minus
-            if (*lhs_type == DataType::Date32
-                || *lhs_type == DataType::Date64
-                || matches!(lhs_type, DataType::Timestamp(_, _))) =>
+            if is_date(lhs_type) || is_timestamp(lhs_type) =>
         {
             match rhs_type {
+                // timestamp/date +/- interval returns timestamp/date
                 DataType::Interval(_) => Some(lhs_type.clone()),
+                // providing more helpful error message
+                DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
+                    return Err(DataFusionError::Plan(
+                        format!(
+                            "'{lhs_type:?} {op} {rhs_type:?}' is an unsupported operation. \
+                                addition/subtraction on dates/timestamps only supported with interval types"
+                        ),
+                    ));
+                }
                 _ => None,
             }
         }
@@ -138,7 +141,7 @@ pub fn coerce_types(
         Operator::RegexMatch
         | Operator::RegexIMatch
         | Operator::RegexNotMatch
-        | Operator::RegexNotIMatch => string_coercion(lhs_type, rhs_type),
+        | Operator::RegexNotIMatch => regex_coercion(lhs_type, rhs_type),
         // "||" operator has its own rules, and always return a string type
         Operator::StringConcat => string_concat_coercion(lhs_type, rhs_type),
         Operator::IsDistinctFrom | Operator::IsNotDistinctFrom => {
@@ -150,8 +153,7 @@ pub fn coerce_types(
     match result {
         None => Err(DataFusionError::Plan(
             format!(
-                "'{:?} {} {:?}' can't be evaluated because there isn't a common type to coerce the types to",
-                lhs_type, op, rhs_type
+                "'{lhs_type:?} {op} {rhs_type:?}' can't be evaluated because there isn't a common type to coerce the types to"
             ),
         )),
         Some(t) => Ok(t)
@@ -326,7 +328,10 @@ fn mathematics_numerical_coercion(
     // same type => all good
     // TODO: remove this
     // bug: https://github.com/apache/arrow-datafusion/issues/3387
-    if lhs_type == rhs_type {
+    if lhs_type == rhs_type
+        && !(matches!(lhs_type, DataType::Dictionary(_, _))
+            || matches!(rhs_type, DataType::Dictionary(_, _)))
+    {
         return Some(lhs_type.clone());
     }
 
@@ -338,6 +343,18 @@ fn mathematics_numerical_coercion(
         }
         (Null, dec_type @ Decimal128(_, _)) | (dec_type @ Decimal128(_, _), Null) => {
             Some(dec_type.clone())
+        }
+        (Dictionary(_, lhs_value_type), Dictionary(_, rhs_value_type)) => {
+            mathematics_numerical_coercion(mathematics_op, lhs_value_type, rhs_value_type)
+        }
+        (Dictionary(key_type, value_type), _) => {
+            let value_type =
+                mathematics_numerical_coercion(mathematics_op, value_type, rhs_type);
+            value_type
+                .map(|value_type| Dictionary(key_type.clone(), Box::new(value_type)))
+        }
+        (_, Dictionary(_, value_type)) => {
+            mathematics_numerical_coercion(mathematics_op, lhs_type, value_type)
         }
         (Decimal128(_, _), Float32 | Float64) => Some(Float64),
         (Float32 | Float64, Decimal128(_, _)) => Some(Float64),
@@ -437,6 +454,16 @@ fn both_numeric_or_null_and_numeric(lhs_type: &DataType, rhs_type: &DataType) ->
     match (lhs_type, rhs_type) {
         (_, DataType::Null) => is_numeric(lhs_type),
         (DataType::Null, _) => is_numeric(rhs_type),
+        (
+            DataType::Dictionary(_, lhs_value_type),
+            DataType::Dictionary(_, rhs_value_type),
+        ) => is_numeric(lhs_value_type) && is_numeric(rhs_value_type),
+        (DataType::Dictionary(_, value_type), _) => {
+            is_numeric(value_type) && is_numeric(rhs_type)
+        }
+        (_, DataType::Dictionary(_, value_type)) => {
+            is_numeric(lhs_type) && is_numeric(value_type)
+        }
         _ => is_numeric(lhs_type) && is_numeric(rhs_type),
     }
 }
@@ -515,10 +542,17 @@ fn string_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
 
 /// coercion rules for like operations.
 /// This is a union of string coercion rules and dictionary coercion rules
-fn like_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
+pub fn like_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     string_coercion(lhs_type, rhs_type)
         .or_else(|| dictionary_coercion(lhs_type, rhs_type, false))
         .or_else(|| null_coercion(lhs_type, rhs_type))
+}
+
+/// coercion rules for regular expression comparison operations.
+/// This is a union of string coercion rules and dictionary coercion rules
+pub fn regex_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
+    string_coercion(lhs_type, rhs_type)
+        .or_else(|| dictionary_coercion(lhs_type, rhs_type, false))
 }
 
 /// Checks if the TimeUnit associated with a Time32 or Time64 type is consistent,
@@ -539,28 +573,30 @@ fn is_time_with_valid_unit(datatype: DataType) -> bool {
 fn temporal_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
     match (lhs_type, rhs_type) {
-        (Date64, Date32) => Some(Date64),
-        (Date32, Date64) => Some(Date64),
-        (Utf8, Date32) => Some(Date32),
-        (Date32, Utf8) => Some(Date32),
-        (Utf8, Date64) => Some(Date64),
-        (Date64, Utf8) => Some(Date64),
-        (Utf8, Time32(unit)) => match is_time_with_valid_unit(Time32(unit.clone())) {
-            false => None,
-            true => Some(Time32(unit.clone())),
-        },
-        (Time32(unit), Utf8) => match is_time_with_valid_unit(Time32(unit.clone())) {
-            false => None,
-            true => Some(Time32(unit.clone())),
-        },
-        (Utf8, Time64(unit)) => match is_time_with_valid_unit(Time64(unit.clone())) {
-            false => None,
-            true => Some(Time64(unit.clone())),
-        },
-        (Time64(unit), Utf8) => match is_time_with_valid_unit(Time64(unit.clone())) {
-            false => None,
-            true => Some(Time64(unit.clone())),
-        },
+        (Date64, Date32) | (Date32, Date64) => Some(Date64),
+        (Utf8, Date32) | (Date32, Utf8) => Some(Date32),
+        (Utf8, Date64) | (Date64, Utf8) => Some(Date64),
+        (Utf8, Time32(unit)) | (Time32(unit), Utf8) => {
+            match is_time_with_valid_unit(Time32(unit.clone())) {
+                false => None,
+                true => Some(Time32(unit.clone())),
+            }
+        }
+        (Utf8, Time64(unit)) | (Time64(unit), Utf8) => {
+            match is_time_with_valid_unit(Time64(unit.clone())) {
+                false => None,
+                true => Some(Time64(unit.clone())),
+            }
+        }
+        (Timestamp(_, tz), Utf8) | (Utf8, Timestamp(_, tz)) => {
+            Some(Timestamp(TimeUnit::Nanosecond, tz.clone()))
+        }
+        (Timestamp(_, None), Date32) | (Date32, Timestamp(_, None)) => {
+            Some(Timestamp(TimeUnit::Nanosecond, None))
+        }
+        (Timestamp(_, _tz), Date32) | (Date32, Timestamp(_, _tz)) => {
+            Some(Timestamp(TimeUnit::Nanosecond, None))
+        }
         (Timestamp(lhs_unit, lhs_tz), Timestamp(rhs_unit, rhs_tz)) => {
             let tz = match (lhs_tz, rhs_tz) {
                 // can't cast across timezones
@@ -666,6 +702,7 @@ mod tests {
     use super::*;
     use crate::Operator;
     use arrow::datatypes::DataType;
+    use datafusion_common::assert_contains;
     use datafusion_common::DataFusionError;
     use datafusion_common::Result;
 
@@ -843,13 +880,30 @@ mod tests {
     }
 
     #[test]
+    fn test_date_timestamp_arithmetic_error() -> Result<()> {
+        let err = coerce_types(
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            &Operator::Minus,
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_contains!(&err, "'Timestamp(Nanosecond, None) - Timestamp(Nanosecond, None)' is an unsupported operation. addition/subtraction on dates/timestamps only supported with interval types");
+
+        let err = coerce_types(&DataType::Date32, &Operator::Plus, &DataType::Date64)
+            .unwrap_err()
+            .to_string();
+        assert_contains!(&err, "'Date32 + Date64' is an unsupported operation. addition/subtraction on dates/timestamps only supported with interval types");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_type_coercion() -> Result<()> {
-        test_coercion_binary_rule!(
-            DataType::Utf8,
-            DataType::Utf8,
-            Operator::Like,
-            DataType::Utf8
-        );
+        // test like coercion rule
+        let result = like_coercion(&DataType::Utf8, &DataType::Utf8);
+        assert_eq!(result, Some(DataType::Utf8));
+
         test_coercion_binary_rule!(
             DataType::Utf8,
             DataType::Date32,
@@ -888,6 +942,30 @@ mod tests {
         );
         test_coercion_binary_rule!(
             DataType::Utf8,
+            DataType::Timestamp(TimeUnit::Second, None),
+            Operator::Lt,
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        test_coercion_binary_rule!(
+            DataType::Utf8,
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            Operator::Lt,
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        test_coercion_binary_rule!(
+            DataType::Utf8,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            Operator::Lt,
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        test_coercion_binary_rule!(
+            DataType::Utf8,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            Operator::Lt,
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        test_coercion_binary_rule!(
+            DataType::Utf8,
             DataType::Utf8,
             Operator::RegexMatch,
             DataType::Utf8
@@ -900,6 +978,30 @@ mod tests {
         );
         test_coercion_binary_rule!(
             DataType::Utf8,
+            DataType::Utf8,
+            Operator::RegexNotIMatch,
+            DataType::Utf8
+        );
+        test_coercion_binary_rule!(
+            DataType::Dictionary(DataType::Int32.into(), DataType::Utf8.into()),
+            DataType::Utf8,
+            Operator::RegexMatch,
+            DataType::Utf8
+        );
+        test_coercion_binary_rule!(
+            DataType::Dictionary(DataType::Int32.into(), DataType::Utf8.into()),
+            DataType::Utf8,
+            Operator::RegexIMatch,
+            DataType::Utf8
+        );
+        test_coercion_binary_rule!(
+            DataType::Dictionary(DataType::Int32.into(), DataType::Utf8.into()),
+            DataType::Utf8,
+            Operator::RegexNotMatch,
+            DataType::Utf8
+        );
+        test_coercion_binary_rule!(
+            DataType::Dictionary(DataType::Int32.into(), DataType::Utf8.into()),
             DataType::Utf8,
             Operator::RegexNotIMatch,
             DataType::Utf8
@@ -1098,13 +1200,13 @@ mod tests {
             DataType::Null,
             DataType::Null,
             Operator::Or,
-            DataType::Null
+            DataType::Boolean
         );
         test_coercion_binary_rule!(
             DataType::Null,
             DataType::Null,
             Operator::And,
-            DataType::Null
+            DataType::Boolean
         );
         test_coercion_binary_rule!(
             DataType::Null,
